@@ -1,0 +1,510 @@
+
+name: IA Autonoma de Ports
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ia-ports
+  cancel-in-progress: false
+
+jobs:
+  entrenar-ia:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Descargar proyecto
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar herramientas
+        run: |
+          python -m pip install --upgrade pip
+          pip install "transformers==4.46.3" "peft==0.13.2" "accelerate==1.1.1" torch requests playwright safetensors
+          playwright install --with-deps chromium
+
+      - name: Ejecutar agente y entrenamiento
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > agent.py <<'PY'
+          import os, json, time, re, zipfile, shutil, subprocess
+          from pathlib import Path
+          import requests
+          import torch
+
+          from transformers import AutoTokenizer, AutoModelForCausalLM
+          from peft import LoraConfig, get_peft_model, PeftModel
+
+          ROOT = Path(".")
+          DATA = ROOT / "ia_data"
+          MEMORY = DATA / "memory.json"
+          EXAMPLES = DATA / "examples.jsonl"
+          ADAPTER = DATA / "adapter"
+          RESULTS = ROOT / "ports"
+          TEMP = Path("/tmp/ia_ports")
+
+          for p in [DATA, RESULTS, TEMP]:
+              p.mkdir(parents=True, exist_ok=True)
+
+          MODEL_NAME = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+          DEVICE = "cpu"
+
+          torch.set_num_threads(4)
+
+          def read_json(path, default):
+              try:
+                  return json.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  return default
+
+          memory = read_json(MEMORY, {
+              "processed": [],
+              "knowledge": [],
+              "successes": 0,
+              "training_runs": 0
+          })
+
+          def save():
+              MEMORY.write_text(
+                  json.dumps(memory, indent=2, ensure_ascii=False),
+                  encoding="utf-8"
+              )
+
+          print("Descargando modelo:", MODEL_NAME)
+
+          tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+          if tokenizer.pad_token is None:
+              tokenizer.pad_token = tokenizer.eos_token
+
+          base = AutoModelForCausalLM.from_pretrained(
+              MODEL_NAME,
+              torch_dtype=torch.float32,
+              low_cpu_mem_usage=True
+          )
+
+          if (ADAPTER / "adapter_config.json").exists():
+              model = PeftModel.from_pretrained(
+                  base, str(ADAPTER), is_trainable=True
+              )
+              print("Adaptador anterior recuperado.")
+          else:
+              config = LoraConfig(
+                  r=4,
+                  lora_alpha=8,
+                  lora_dropout=0.05,
+                  bias="none",
+                  task_type="CAUSAL_LM",
+                  target_modules=[
+                      "q_proj", "k_proj", "v_proj", "o_proj"
+                  ]
+              )
+              model = get_peft_model(base, config)
+              print("Adaptador nuevo creado.")
+
+          model.eval()
+
+          def generate(prompt, max_tokens=1200):
+              messages = [
+                  {
+                      "role": "system",
+                      "content": (
+                          "Eres un experto en programación de videojuegos "
+                          "HTML5. Convierte proyectos a HTML, JavaScript "
+                          "y Canvas. Devuelve código completo y no inventes "
+                          "funciones que no puedas deducir del proyecto."
+                      )
+                  },
+                  {"role": "user", "content": prompt}
+              ]
+
+              inputs = tokenizer.apply_chat_template(
+                  messages,
+                  add_generation_prompt=True,
+                  return_tensors="pt",
+                  truncation=True,
+                  max_length=5000
+              )
+
+              model.eval()
+              with torch.no_grad():
+                  output = model.generate(
+                      inputs,
+                      max_new_tokens=max_tokens,
+                      do_sample=False,
+                      pad_token_id=tokenizer.eos_token_id
+                  )
+
+              return tokenizer.decode(
+                  output[0][inputs.shape[1]:],
+                  skip_special_tokens=True
+              )
+
+          def search_games():
+              queries = [
+                  "open source HTML5 game",
+                  "open source JavaScript game",
+                  "open source Phaser game",
+                  "open source 2D game"
+              ]
+
+              found = {}
+              headers = {
+                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                  "Accept": "application/vnd.github+json"
+              }
+
+              for q in queries:
+                  try:
+                      response = requests.get(
+                          "https://api.github.com/search/repositories",
+                          params={
+                              "q": q + " fork:false",
+                              "sort": "stars",
+                              "order": "desc",
+                              "per_page": 10
+                          },
+                          headers=headers,
+                          timeout=30
+                      )
+
+                      if response.status_code != 200:
+                          print("GitHub:", response.status_code)
+                          continue
+
+                      for r in response.json().get("items", []):
+                          if not r.get("license"):
+                              continue
+                          name = r["full_name"]
+                          if name not in memory["processed"]:
+                              found[name] = {
+                                  "name": name,
+                                  "description": r.get("description") or "",
+                                  "branch": r.get("default_branch") or "main",
+                                  "license": r["license"].get("spdx_id", "")
+                              }
+                  except Exception as e:
+                      print("Error de búsqueda:", e)
+
+                  time.sleep(2)
+
+              return list(found.values())
+
+          def download(repo):
+              folder = TEMP / "source"
+              shutil.rmtree(folder, ignore_errors=True)
+              folder.mkdir(parents=True)
+
+              url = (
+                  "https://codeload.github.com/"
+                  + repo["name"]
+                  + "/zip/refs/heads/"
+                  + repo["branch"]
+              )
+
+              response = requests.get(url, timeout=90)
+              response.raise_for_status()
+
+              archive_path = TEMP / "source.zip"
+              archive_path.write_bytes(response.content)
+
+              with zipfile.ZipFile(archive_path) as z:
+                  root = folder.resolve()
+                  for item in z.infolist():
+                      target = (folder / item.filename).resolve()
+                      if os.path.commonpath([str(root), str(target)]) != str(root):
+                          continue
+                      if item.file_size < 2000000:
+                          z.extract(item, folder)
+
+              archive_path.unlink(missing_ok=True)
+              dirs = [x for x in folder.iterdir() if x.is_dir()]
+              return dirs[0] if dirs else folder
+
+          EXTENSIONS = {
+              ".js", ".ts", ".html", ".css", ".json",
+              ".cpp", ".c", ".h", ".hpp", ".cs",
+              ".gd", ".java", ".md", ".txt"
+          }
+
+          def inspect(folder):
+              files = []
+              for p in folder.rglob("*"):
+                  if not p.is_file() or p.suffix.lower() not in EXTENSIONS:
+                      continue
+                  if any(x in p.parts for x in [
+                      ".git", "node_modules", "dist", "build", "vendor"
+                  ]):
+                      continue
+                  try:
+                      if p.stat().st_size > 100000:
+                          continue
+                      content = p.read_text(
+                          encoding="utf-8", errors="ignore"
+                      )
+                      if content.strip():
+                          files.append((p, content))
+                  except Exception:
+                      pass
+
+              priority = [
+                  "README.md", "package.json", "index.html",
+                  "main.js", "game.js", "CMakeLists.txt",
+                  "project.godot"
+              ]
+
+              files.sort(
+                  key=lambda x: (
+                      0 if x[0].name in priority else 1
+                  )
+              )
+
+              result = []
+              total = 0
+
+              for p, content in files:
+                  remaining = 12000 - total
+                  if remaining <= 0:
+                      break
+                  content = content[:remaining]
+                  result.append(
+                      "\n\nFILE: "
+                      + str(p.relative_to(folder))
+                      + "\n"
+                      + content
+                  )
+                  total += len(content)
+
+              return "\n".join(result)
+
+          def extract_html(answer):
+              answer = re.sub(
+                  r"^```(?:html)?\s*", "", answer.strip(),
+                  flags=re.I
+              )
+              answer = re.sub(r"\s*```$", "", answer.strip())
+              match = re.search(
+                  r"<!doctype html|<html",
+                  answer,
+                  flags=re.I
+              )
+              return answer[match.start():] if match else answer
+
+          def browser_test(path):
+              from playwright.sync_api import sync_playwright
+
+              errors = []
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(
+                      headless=True,
+                      args=["--no-sandbox"]
+                  )
+                  page = browser.new_page()
+                  page.on("pageerror", lambda e: errors.append(str(e)))
+                  page.goto(
+                      Path(path).resolve().as_uri(),
+                      wait_until="load",
+                      timeout=30000
+                  )
+                  page.wait_for_timeout(1500)
+                  browser.close()
+
+              return errors
+
+          def convert(repo):
+              folder = download(repo)
+              source = inspect(folder)
+
+              if len(source) < 100:
+                  print("No hay suficiente código.")
+                  return
+
+              knowledge = "\n".join(memory["knowledge"][-15:])
+
+              prompt = f"""
+          Convierte este videojuego a HTML5.
+
+          REPOSITORIO: {repo['name']}
+          DESCRIPCIÓN: {repo['description']}
+          LICENCIA: {repo['license']}
+
+          CONOCIMIENTOS ANTERIORES:
+          {knowledge}
+
+          CÓDIGO FUENTE:
+          {source}
+
+          Devuelve un único HTML completo.
+          Integra CSS y JavaScript.
+          Conserva las mecánicas identificables.
+          Utiliza Canvas cuando sea adecuado.
+          Si faltan recursos, crea alternativas sencillas.
+          No afirmes que has compilado el proyecto original.
+          """
+
+              answer = extract_html(generate(prompt))
+
+              if (
+                  len(answer) < 300
+                  or "<html" not in answer.lower()
+                  or "</html>" not in answer.lower()
+                  or "<script" not in answer.lower()
+              ):
+                  print("HTML incompleto. No se guarda como aprendizaje.")
+                  return
+
+              output_dir = RESULTS / repo["name"].replace("/", "__")
+              output_dir.mkdir(parents=True, exist_ok=True)
+              output_file = output_dir / "index.html"
+              output_file.write_text(answer, encoding="utf-8")
+
+              try:
+                  errors = browser_test(output_file)
+              except Exception as e:
+                  print("No se pudo completar la prueba:", e)
+                  return
+
+              if errors:
+                  print("El navegador detectó errores:", errors[:5])
+                  return
+
+              # La carga correcta es una prueba básica, no garantiza
+              # que todas las mecánicas del videojuego funcionen.
+              record = {
+                  "prompt": prompt,
+                  "answer": answer,
+                  "repo": repo["name"]
+              }
+
+              with open(EXAMPLES, "a", encoding="utf-8") as f:
+                  f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+              memory["successes"] += 1
+              memory["knowledge"].append(
+                  "Conversión HTML abierta sin errores de página: "
+                  + repo["name"]
+                  + ". HTML guardado en "
+                  + str(output_file)
+              )
+
+              print("Conversión guardada:", output_file)
+
+          def train():
+              if not EXAMPLES.exists():
+                  print("No hay ejemplos de entrenamiento.")
+                  return
+
+              records = []
+              with open(EXAMPLES, encoding="utf-8") as f:
+                  for line in f:
+                      try:
+                          records.append(json.loads(line))
+                      except Exception:
+                          pass
+
+              records = records[-8:]
+
+              if len(records) < 2:
+                  print("Se necesitan al menos dos ejemplos.")
+                  return
+
+              model.train()
+              optimizer = torch.optim.AdamW(
+                  [p for p in model.parameters() if p.requires_grad],
+                  lr=0.00002
+              )
+
+              for epoch in range(1):
+                  for record in records:
+                      text = (
+                          "Convierte este proyecto a HTML:\n"
+                          + record["prompt"][:3500]
+                          + "\nRESULTADO:\n"
+                          + record["answer"][:5000]
+                      )
+
+                      tokens = tokenizer(
+                          text,
+                          return_tensors="pt",
+                          truncation=True,
+                          max_length=1800
+                      )
+
+                      ids = tokens["input_ids"]
+                      labels = ids.clone()
+
+                      optimizer.zero_grad()
+                      output = model(
+                          input_ids=ids,
+                          attention_mask=tokens["attention_mask"],
+                          labels=labels
+                      )
+
+                      output.loss.backward()
+                      optimizer.step()
+
+                      print("Pérdida:", float(output.loss.detach()))
+
+              model.eval()
+              ADAPTER.mkdir(parents=True, exist_ok=True)
+              model.save_pretrained(str(ADAPTER))
+              tokenizer.save_pretrained(str(ADAPTER))
+
+              memory["training_runs"] += 1
+              print("Entrenamiento LoRA guardado.")
+
+          # ------------------- AGENTE PRINCIPAL -------------------
+
+          games = search_games()
+          print("Proyectos encontrados:", len(games))
+
+          # Solo un proyecto por ejecución para proteger CPU y memoria.
+          if games:
+              repo = games[0]
+              print("Procesando:", repo["name"])
+
+              try:
+                  convert(repo)
+              except Exception as e:
+                  print("Error de conversión:", e)
+
+              memory["processed"].append(repo["name"])
+              save()
+
+          # Entrenar solo con ejemplos que hayan superado la
+          # comprobación básica del navegador.
+          try:
+              train()
+          except Exception as e:
+              print("Error de entrenamiento:", e)
+
+          save()
+          print("Sesión terminada.")
+          print("Conversiones guardadas:", memory["successes"])
+          print("Entrenamientos:", memory["training_runs"])
+          PY
+
+          python agent.py
+
+      - name: Guardar aprendizaje y resultados
+        run: |
+          git config user.name "IA Ports Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add ia_data ports
+          if ! git diff --cached --quiet; then
+            git commit -m "Actualizar memoria y aprendizaje de IA"
+            git push
+          fi
+          
