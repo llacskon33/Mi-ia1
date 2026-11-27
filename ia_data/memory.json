@@ -1,12 +1,13 @@
 {
   "processed": [
     "4ian/GDevelop",
-    "freeciv/freeciv-web"
+    "freeciv/freeciv-web",
+    "increpare/PuzzleScript"
   ],
   "knowledge": [
     "Conversión HTML abierta sin errores de página: 4ian/GDevelop. HTML guardado en ports/4ian__GDevelop/index.html",
     "Conversión HTML abierta sin errores de página: freeciv/freeciv-web. HTML guardado en ports/freeciv__freeciv-web/index.html"
   ],
   "successes": 2,
-  "training_runs": 1
+  "training_runs": 2
 }
