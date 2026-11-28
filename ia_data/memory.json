@@ -2,12 +2,14 @@
   "processed": [
     "4ian/GDevelop",
     "freeciv/freeciv-web",
-    "increpare/PuzzleScript"
+    "increpare/PuzzleScript",
+    "Kaetram/Kaetram-Open"
   ],
   "knowledge": [
     "Conversión HTML abierta sin errores de página: 4ian/GDevelop. HTML guardado en ports/4ian__GDevelop/index.html",
-    "Conversión HTML abierta sin errores de página: freeciv/freeciv-web. HTML guardado en ports/freeciv__freeciv-web/index.html"
+    "Conversión HTML abierta sin errores de página: freeciv/freeciv-web. HTML guardado en ports/freeciv__freeciv-web/index.html",
+    "Conversión HTML abierta sin errores de página: Kaetram/Kaetram-Open. HTML guardado en ports/Kaetram__Kaetram-Open/index.html"
   ],
-  "successes": 2,
-  "training_runs": 2
+  "successes": 3,
+  "training_runs": 3
 }
